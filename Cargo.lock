@@ -72,6 +72,7 @@ dependencies = [
 name = "ai-pdf"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "iced",
  "image 0.25.10",
  "lopdf",
@@ -80,6 +81,8 @@ dependencies = [
  "pdfium-render 0.9.1",
  "regex",
  "rfd",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -604,6 +607,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
