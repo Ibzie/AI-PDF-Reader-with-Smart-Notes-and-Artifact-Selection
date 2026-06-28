@@ -1,0 +1,350 @@
+import re
+import gc
+import logging
+import platform
+
+log = logging.getLogger("ai_layer")
+
+# ── Model tiers ────────────────────────────────────────────────────────────
+# All repos below were verified to exist and contain .gguf files. The Qwen
+# official GGUF repos publish multi-shard quants (e.g. q4_k_m split into two
+# files); `resolve_quant` returns a glob so llama-cpp-python pulls every shard.
+TIERS = [
+    {
+        "min_ram": 16, "name": "Qwen2.5-14B-Instruct", "footprint": 10.5,
+        "repos": ["Qwen/Qwen2.5-14B-Instruct-GGUF"],
+        "quants": ["Q5_K_M", "Q4_K_M", "Q3_K_M"],
+    },
+    {
+        "min_ram": 14, "name": "Qwen2.5-14B-Instruct", "footprint": 9.5,
+        "repos": ["Qwen/Qwen2.5-14B-Instruct-GGUF"],
+        "quants": ["Q4_K_M", "Q5_K_M", "Q3_K_M"],
+    },
+    {
+        "min_ram": 12, "name": "Gemma-4-12B-it", "footprint": 7.5,
+        "repos": ["unsloth/gemma-4-12b-it-GGUF", "unsloth/gemma-3-12b-it-GGUF"],
+        "quants": ["Q4_K_M", "IQ4_XS", "Q5_K_M", "Q3_K_M"],
+    },
+    {
+        "min_ram": 10, "name": "Qwen2.5-7B-Instruct", "footprint": 4.7,
+        "repos": ["Qwen/Qwen2.5-7B-Instruct-GGUF"],
+        "quants": ["Q4_K_M", "Q5_K_M", "Q3_K_M"],
+    },
+    {
+        "min_ram": 8, "name": "Qwen2.5-3B-Instruct", "footprint": 2.0,
+        "repos": ["Qwen/Qwen2.5-3B-Instruct-GGUF"],
+        "quants": ["Q4_K_M", "Q5_K_M", "Q3_K_M", "Q4_0"],
+    },
+]
+
+HEADROOM_GB = 2.5
+N_CTX = 4096
+MAX_TOKENS = 700
+
+# KV-cache quant: `type_k` takes the ggml type *integer* enum (not a string).
+# We only quantize the K cache (q8_0, near-lossless); quantizing V to q4_0 is
+# unsupported on some llama.cpp builds (e.g. Qwen attention) and makes context
+# creation fail, so V stays the default f16.
+try:
+    from llama_cpp import GGML_TYPE_F16 as _F16, GGML_TYPE_Q8_0 as _Q8_0, GGML_TYPE_Q4_0 as _Q4_0
+except Exception:
+    _F16, _Q8_0, _Q4_0 = 1, 8, 2
+KV_K_LOSSLESS = _Q8_0
+KV_K_TIGHT = _Q4_0
+
+
+def detect_capacity():
+    """Return (available_ram_gb, accelerator) where accelerator in cuda|metal|cpu."""
+    try:
+        import psutil
+        ram = psutil.virtual_memory().available / (1024 ** 3)
+    except Exception:
+        ram = 8.0
+    accel = "cpu"
+    if platform.system() == "Darwin":
+        accel = "metal"
+    else:
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            accel = "cuda"
+            pynvml.nvmlShutdown()
+        except Exception:
+            accel = "cpu"
+    return ram, accel
+
+
+def pick_model(ram_gb):
+    for tier in TIERS:
+        if ram_gb >= tier["min_ram"] and tier["footprint"] + HEADROOM_GB <= ram_gb:
+            return tier
+    # Fall back to the smallest tier if nothing fits cleanly.
+    return TIERS[-1]
+
+
+def resolve_quant(repo_id, quants, on_status=None):
+    """Return the ordered list of GGUF filenames in `repo_id` for the first
+    preferred quant that exists.
+
+    Multi-shard quants (e.g. Qwen 7B+ ``q4_k_m`` split into two files) return
+    every shard in order so `load_model` can pass the first to ``filename=``
+    and the rest to ``additional_files=``. Sidecars (``mmproj`` / ``mtp``)
+    are excluded — they are vision/draft modules, not the LLM weights.
+    """
+    from huggingface_hub import HfApi
+    if on_status:
+        on_status(f"Listing quants for {repo_id}…")
+    try:
+        files = HfApi().list_repo_files(repo_id)
+    except Exception as e:
+        raise RuntimeError(f"Could not list {repo_id}: {e}")
+    ggufs = []
+    for f in files:
+        base = f.lower()
+        if not base.endswith(".gguf"):
+            continue
+        if "mmproj" in base or base.startswith("mtp") or "/mtp" in base:
+            continue
+        ggufs.append(f)
+    if not ggufs:
+        raise RuntimeError(f"No .gguf model files in {repo_id}")
+    for pref in quants:
+        matched = []
+        for f in ggufs:
+            base = f.split("/")[-1]
+            if re.search(r"(?i)(^|[^\w])(" + re.escape(pref) + r")([^\w]|$)", base):
+                matched.append(f)
+        if matched:
+            return _sort_shards(matched)
+    # Last resort: smallest non-sharded GGUF (likely the lowest-bit quant).
+    singles = [f for f in ggufs if "of-" not in f]
+    return [_sort_shards(singles or ggufs)[0]]
+
+
+def _sort_shards(files):
+    def key(f):
+        m = re.search(r"-(\d{5})-of-\d{5}", f)
+        return (int(m.group(1)) if m else 0, f)
+    return sorted(files, key=key)
+
+
+class _SignalTqdm:
+    """A tqdm stand-in whose updates are mirrored to a (done, total, label)
+    callback so a QProgressBar can mirror real byte progress.
+
+    `huggingface_hub.hf_hub_download(tqdm_class=...)` instantiates this class
+    with the same kwargs as `tqdm.tqdm`; we just forward `update`/`close` to the
+    registered callback while doing no terminal I/O.
+    """
+    _callback = None
+
+    def __init__(self, iterable=None,desc=None, total=None, unit=None, unit_scale=False, **_):
+        self._n = 0
+        self._total = int(total) if total else 0
+        self._desc = desc or ""
+        self._fired()
+        # If an iterable was passed, iterate it (rare for hf downloads).
+        if iterable is not None:
+            for _ in iterable:
+                self.update(1)
+
+    def _fired(self):
+        if _SignalTqdm._callback:
+            _SignalTqdm._callback(self._n, self._total, self._desc)
+
+    def update(self, n=1):
+        self._n += n
+        self._fired()
+
+    def set_description(self, desc=None):
+        if desc:
+            self._desc = desc
+        self._fired()
+
+    def set_postfix(self, *a, **k):
+        pass
+
+    def refresh(self):
+        self._fired()
+
+    def close(self):
+        self._fired()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+        return False
+
+
+class AILayer:
+    def __init__(self):
+        self.llm = None
+        self.tier = None
+        self.repo_id = None
+        self.filename = None
+        self.accel = "cpu"
+        self._cancel = False
+
+    # ── loading ────────────────────────────────────────────────────────────
+    def load_model(self, on_status=None, on_progress=None, repo_id=None, filename=None):
+        ram, self.accel = detect_capacity()
+        log.info("capacity: %.1f GB, accel=%s", ram, self.accel)
+        if on_status:
+            on_status(f"Detected {ram:.1f} GB RAM, accelerator: {self.accel}")
+        self.tier = pick_model(ram)
+        log.info("tier: %s (footprint %.1f GB)", self.tier["name"], self.tier["footprint"])
+        self.repo_id = repo_id or self._first_available_repo(self.tier["repos"], on_status)
+        files = [filename] if filename else resolve_quant(
+            self.repo_id, self.tier["quants"], on_status)
+        self.filename = files[0]
+        self._download(files, on_status, on_progress)
+        kvk = KV_K_LOSSLESS if ram >= 12 else KV_K_TIGHT
+        if on_status:
+            on_status(f"Loading {self.tier['name']} ({self.quant_label()})…")
+        # Try GPU first, then progressively safer CPU fallbacks so a tight-RAM
+        # machine never crashes on context creation. Each failure is cleaned
+        # up so the failed mmap weights don't pollute RAM for the next attempt.
+        attempts = []
+        if self.accel != "cpu":
+            attempts.append((N_CTX, -1, kvk))
+        attempts += [
+            (N_CTX, 0, kvk),
+            (N_CTX, 0, KV_K_TIGHT),
+            (2048, 0, KV_K_TIGHT),
+        ]
+        from llama_cpp import Llama
+        for n_ctx, n_gpu, _kvk in attempts:
+            kwargs = dict(
+                repo_id=self.repo_id, filename=self.filename,
+                n_ctx=n_ctx, n_gpu_layers=n_gpu, type_k=_kvk, verbose=False,
+            )
+            if len(files) > 1:
+                kwargs["additional_files"] = files[1:]
+            try:
+                log.info("load attempt n_ctx=%d n_gpu=%d kv=%s", n_ctx, n_gpu, _kvk)
+                self.llm = Llama.from_pretrained(**kwargs)
+                self._loaded_n_ctx = n_ctx
+                break
+            except Exception as e:
+                log.warning("context creation failed (n_ctx=%d, n_gpu=%d): %s", n_ctx, n_gpu, e)
+                self.unload()
+        if self.llm is None:
+            raise RuntimeError("Could not allocate llama context — see ai_layer log")
+        if on_status:
+            on_status(f"Loaded {self.tier['name']} ({self.quant_label()})")
+        log.info("loaded: %s, n_ctx=%d", self.tier['name'], self._loaded_n_ctx)
+
+    def unload(self):
+        """Release the loaded model and reclaim resident RAM immediately."""
+        if self.llm is not None:
+            try:
+                del self.llm
+            except Exception:
+                pass
+        self.llm = None
+        gc.collect()
+
+    def _download(self, files, on_status=None, on_progress=None):
+        from huggingface_hub import hf_hub_download
+        _SignalTqdm._callback = on_progress
+        try:
+            for i, fn in enumerate(files, 1):
+                if on_status:
+                    on_status(f"Downloading {fn} ({i}/{len(files)})…")
+                hf_hub_download(
+                    repo_id=self.repo_id, filename=fn,
+                    tqdm_class=_SignalTqdm,
+                )
+        finally:
+            _SignalTqdm._callback = None
+
+    def _first_available_repo(self, repos, on_status):
+        from huggingface_hub import HfApi
+        api = HfApi()
+        for r in repos:
+            try:
+                api.repo_info(r)
+                return r
+            except Exception:
+                if on_status:
+                    on_status(f"Repo {r} unavailable, trying next…")
+        raise RuntimeError(f"None of {repos} were reachable")
+
+    def is_loaded(self):
+        return self.llm is not None
+
+    def model_label(self):
+        if not self.tier:
+            return "AI: idle"
+        return f"AI: {self.tier['name']} ({self.quant_label()})"
+
+    def quant_label(self):
+        if not self.filename:
+            return ""
+        m = re.search(r"(Q[0-9_]+[A-Z_]*|IQ[0-9_]+[A-Z_]*)", self.filename, re.I)
+        return m.group(1).upper() if m else ""
+
+    def request_cancel(self):
+        self._cancel = True
+
+    def reset_cancel(self):
+        self._cancel = False
+
+    @property
+    def cancelled(self):
+        return self._cancel
+
+    # ── command dispatch ───────────────────────────────────────────────────
+    # Each command returns (messages, heading) so the worker knows what to
+    # prepend before streaming tokens into the notes file.
+    def build_request(self, command, *, notes="", page_text="", page_idx=None, question=""):
+        sys = (
+            "You are an AI note assistant embedded in a PDF reader. "
+            "Write in clean Markdown only. Be concise and faithful to the source. "
+            "When you reference content from the user's notes or a page, keep the "
+            "`Page N` markers that appear in the source."
+        )
+        if command == "summarize_notes":
+            user = f"Summarize my notes into a Markdown bullet list.\n\nNOTES:\n{notes}"
+            heading = "## AI — Summary"
+        elif command == "summarize_page":
+            user = (f"Summarize page {page_idx + 1} of the PDF into a Markdown "
+                    f"bullet list.\n\nPAGE {page_idx + 1} TEXT:\n{page_text}")
+            heading = f"## AI — Page {page_idx + 1} Summary"
+        elif command == "answer":
+            user = (f"Answer the question using the notes below. "
+                    f"If the notes don't cover it, say so.\n\n"
+                    f"QUESTION: {question}\n\nNOTES:\n{notes}")
+            heading = "## AI — Answer"
+        elif command == "extract_todos":
+            user = f"Extract action items as a Markdown checklist.\n\nNOTES:\n{notes}"
+            heading = "## AI — To-Dos"
+        elif command == "suggest_tags":
+            user = (f"Suggest 3-6 short tags for these notes as a single Markdown "
+                    f"line of `#tag` tokens.\n\nNOTES:\n{notes}")
+            heading = "## AI — Suggested Tags"
+        elif command == "draft":
+            user = (f"Draft a short follow-up note that ties together the themes in "
+                    f"these notes.\n\nNOTES:\n{notes}")
+            heading = "## AI — Draft"
+        else:
+            raise ValueError(f"Unknown command {command}")
+        return [{"role": "system", "content": sys}, {"role": "user", "content": user}], heading
+
+    # ── inference ──────────────────────────────────────────────────────────
+    def generate(self, messages, on_token=None):
+        if not self.llm:
+            raise RuntimeError("AI model not loaded")
+        self.reset_cancel()
+        stream = self.llm.create_chat_completion(
+            messages=messages, stream=True, max_tokens=MAX_TOKENS
+        )
+        for chunk in stream:
+            if self._cancel:
+                break
+            delta = chunk["choices"][0].get("delta", {})
+            token = delta.get("content")
+            if token and on_token:
+                on_token(token)

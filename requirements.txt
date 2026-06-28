@@ -1,2 +1,5 @@
 PyQt6>=6.6
 PyMuPDF>=1.23
+llama-cpp-python>=0.3
+huggingface_hub>=0.20
+psutil>=5.9

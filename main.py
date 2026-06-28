@@ -1,18 +1,20 @@
-import sys, json, os
+import sys, json, os, logging, logging.handlers
 from datetime import datetime
 from pathlib import Path
 from PyQt6.QtCore import Qt, QPoint
-from PyQt6.QtGui import QColor, QKeyEvent
+from PyQt6.QtGui import QColor, QKeyEvent, QCursor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QLabel, QLineEdit, QPushButton, QScrollArea, QFrame,
     QFileDialog, QMessageBox, QMenu, QListWidget, QListWidgetItem,
-    QStatusBar, QSplitter
+    QStatusBar, QSplitter, QInputDialog, QProgressBar
 )
 from pdf_engine import PdfEngine, ZOOM_LEVELS
 from page_view import PageView
 from notes_panel import NotesPanel
 from storage import PdfStorage
+from ai_layer import AILayer
+from ai_workers import LoadWorker, InferWorker
 
 
 class MainWindow(QMainWindow):
@@ -28,6 +30,9 @@ class MainWindow(QMainWindow):
         self.search_results = []
         self.search_index = 0
         self.capture_mode = False
+        self.ai = AILayer()
+        self.ai_loader = None
+        self.ai_infer = None
         self.setWindowTitle("AI-PDF Reader")
         self.resize(1600, 900)
         self.setStyleSheet("background-color: #121212; color: #eeeeee;")
@@ -75,6 +80,20 @@ class MainWindow(QMainWindow):
         self.toolbar.addSeparator()
         self.toolbar.addWidget(QPushButton("☰", clicked=self.toggle_sidebar))
         self.toolbar.addWidget(QPushButton("📝", clicked=self.toggle_notes))
+        self.toolbar.addWidget(QPushButton("AI", clicked=self.show_ai_menu))
+        self.ai_progress = QProgressBar()
+        self.ai_progress.setFixedWidth(200)
+        self.ai_progress.setTextVisible(True)
+        self.ai_progress.setStyleSheet(
+            "QProgressBar { background: #2a2a2a; border: 1px solid #444; height: 16px; }"
+            "QProgressBar::chunk { background: #4a90d9; }"
+        )
+        self.ai_progress.setVisible(False)
+        self.ai_progress_lbl = QLabel("")
+        self.ai_progress_lbl.setStyleSheet("color: #aaa;")
+        self.ai_progress_lbl.setVisible(False)
+        self.toolbar.addWidget(self.ai_progress_lbl)
+        self.toolbar.addWidget(self.ai_progress)
 
     def _build_sidebar(self):
         self.sidebar = QFrame()
@@ -373,10 +392,103 @@ class MainWindow(QMainWindow):
         page.clear_selection()
         self.cancel_capture()
 
+    # ── AI layer ────────────────────────────────────────────────────────────
+    def show_ai_menu(self):
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background-color: #1e1e1e; color: #eee; border: 1px solid #444; }"
+            "QMenu::item:selected { background-color: #333; }"
+        )
+        if not self.ai.is_loaded():
+            menu.addAction("Load AI Model", self._load_ai)
+        else:
+            notes = self.notes_panel.get_text()
+            menu.addAction("Summarize Notes", lambda: self._run_ai("summarize_notes", notes=notes))
+            if self.engine.doc:
+                idx = self.current_page
+                txt = self.engine.extract_page_text(idx)
+                menu.addAction("Summarize Current Page",
+                               lambda: self._run_ai("summarize_page", page_text=txt, page_idx=idx))
+            menu.addAction("Ask…", self._ai_ask)
+            menu.addAction("Extract To-Dos", lambda: self._run_ai("extract_todos", notes=notes))
+            menu.addAction("Draft Follow-up", lambda: self._run_ai("draft", notes=notes))
+            menu.addAction("Suggest Tags", lambda: self._run_ai("suggest_tags", notes=notes))
+        menu.addSeparator()
+        if self.ai_infer and self.ai_infer.isRunning():
+            menu.addAction("Cancel AI", self._cancel_ai)
+        menu.exec(QCursor.pos())
+
+    def _load_ai(self):
+        if self.ai_loader and self.ai_loader.isRunning():
+            return
+        self.ai_loader = LoadWorker(self.ai)
+        self.ai_loader.status.connect(self._ai_load_status)
+        self.ai_loader.progress.connect(self._ai_load_progress)
+        self.ai_loader.done.connect(self._ai_loaded)
+        self.ai_loader.failed.connect(self._ai_failed)
+        self.ai_progress.setVisible(True)
+        self.ai_progress_lbl.setVisible(True)
+        self.ai_progress.setRange(0, 0)
+        self.ai_progress.setValue(0)
+        self.ai_progress_lbl.setText("AI: preparing…")
+        self.ai_loader.start()
+
+    def _ai_load_status(self, msg):
+        # Status messages render in the toolbar progress label, not bottom bar.
+        if msg.startswith(("Detected", "Listing", "Downloading", "Loading")):
+            self.ai_progress_lbl.setText(msg)
+        else:
+            self.status.showMessage(msg)
+
+    def _ai_load_progress(self, done, total, label):
+        if total <= 0:
+            self.ai_progress.setRange(0, 0)
+            self.ai_progress.setValue(0)
+        else:
+            self.ai_progress.setRange(0, total)
+            self.ai_progress.setValue(done)
+        self.ai_progress_lbl.setText(label or self.ai_progress_lbl.text())
+
+    def _ai_loaded(self, label):
+        self.ai_progress.setVisible(False)
+        self.ai_progress_lbl.setVisible(False)
+        self.status.showMessage(label)
+
+    def _ai_failed(self, msg):
+        self.ai_progress.setVisible(False)
+        self.ai_progress_lbl.setVisible(False)
+        self.status.showMessage(f"AI error: {msg}")
+
+    def _ai_ask(self):
+        q, ok = QInputDialog.getText(self, "Ask AI", "Question:")
+        if ok and q:
+            self._run_ai("answer", question=q, notes=self.notes_panel.get_text())
+
+    def _run_ai(self, command, **kwargs):
+        if not self.ai.is_loaded():
+            self.status.showMessage("Load AI model first (toolbar → AI)")
+            return
+        if self.ai_infer and self.ai_infer.isRunning():
+            self.status.showMessage("AI busy — press Esc to cancel")
+            return
+        self.ai_infer = InferWorker(self.ai, command, **kwargs)
+        self.ai_infer.heading.connect(self.notes_panel.stream_start)
+        self.ai_infer.token.connect(self.notes_panel.stream_token)
+        self.ai_infer.finished_ok.connect(lambda _: self.notes_panel.stream_end())
+        self.ai_infer.failed.connect(self._ai_failed)
+        self.ai_infer.start()
+        self.status.showMessage(f"AI: {command.replace('_', ' ')}…  (Esc to cancel)")
+
+    def _cancel_ai(self):
+        self.ai.request_cancel()
+        self.status.showMessage("AI: cancelling…")
+
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key.Key_Escape:
             if self.capture_mode:
                 self.cancel_capture()
+            elif self.ai_infer and self.ai_infer.isRunning():
+                self._cancel_ai()
             else:
                 self.clear_search()
             return
@@ -400,8 +512,26 @@ class MainWindow(QMainWindow):
         if self.fit_width and self.pages:
             self._apply_zoom()
 
+    def closeEvent(self, event):
+        # Stop AI workers and free the model so failed runs don't leak RAM.
+        for w in (self.ai_loader, self.ai_infer):
+            if w and w.isRunning():
+                self.ai.request_cancel()
+                w.quit()
+                w.wait(3000)
+        self.ai.unload()
+        super().closeEvent(event)
+
 
 def main():
+    # Lean AI logging to ai.log (rotates at 1 MB, keeps 1 backup).
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    logging.basicConfig(
+        handlers=[logging.handlers.RotatingFileHandler(
+            "ai.log", maxBytes=1_000_000, backupCount=1)],
+        level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     palette = app.palette()

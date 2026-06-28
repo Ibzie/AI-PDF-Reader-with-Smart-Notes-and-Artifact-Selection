@@ -12,9 +12,15 @@ A fast, native PDF reader with a graphical interface, built in Python.
 - **Text highlights** — saved as images per PDF and stored in a notes markdown file
 - **Screen captures** — saved as images per PDF and embedded into notes
 - **Notes panel** — editable Markdown notes for each PDF (Obsidian-style)
+- **Built-in AI layer** — runs a local model in-process (llama.cpp): summarize
+  notes, summarize a page, Q&A grounded in your notes, extract to-dos, draft
+  follow-ups, suggest tags. Streams output straight into the notes file.
 - **Keyboard shortcuts** for all common actions
 - **Dark theme** by default
 - **Cross-platform** — Linux, macOS, Windows
+
+> The AI layer needs ≥ 8 GB RAM. On first use it downloads an open-weights
+> GGUF model (Qwen3.5/3.6 or Gemma-4) sized to your machine, via Hugging Face.
 
 ## Installation
 
@@ -27,6 +33,14 @@ python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
+
+For GPU acceleration (NVIDIA) build `llama-cpp-python` against CUDA:
+
+```bash
+CMAKE_ARGS="-DGGML_CUDA=on" pip install --upgrade --force-reinstall llama-cpp-python
+```
+
+On Apple Silicon `Metal` is picked up automatically from the prebuilt wheel.
 
 ## Usage
 
@@ -51,6 +65,21 @@ For each opened PDF a folder is created at `notes/<pdf-name>/` containing:
 - **Existing highlight:** Remove Highlight
 - **Empty area:** Capture Screen
 
+### AI menu (toolbar → AI)
+
+| Command | What it does |
+|---------|---------------|
+| Load AI Model | Detects RAM/accel, downloads a fitting GGUF, loads in-process |
+| Summarize Notes | Markdown bullet summary of the whole `notes.md` |
+| Summarize Current Page | Bullet summary of the page in view |
+| Ask… | Free-form Q&A grounded in your notes |
+| Extract To-Dos | Markdown checklist of action items |
+| Draft Follow-up | A short connecting note |
+| Suggest Tags | A line of `#tag` tokens |
+
+AI output is streamed live into the notes panel and saved like any other note.
+`Esc` cancels an active run.
+
 ### Keyboard Shortcuts
 
 | Shortcut | Action |
@@ -61,11 +90,11 @@ For each opened PDF a folder is created at `notes/<pdf-name>/` containing:
 | `Ctrl+-` | Zoom out |
 | `Alt+Right` | Next page |
 | `Alt+Left` | Previous page |
-| `Esc` | Clear search / cancel capture |
+| `Esc` | Clear search / cancel capture / cancel AI |
 
 ## Tech Stack
 
-Python, [PyQt6](https://riverbankcomputing.com/software/pyqt/), [PyMuPDF](https://pymupdf.readthedocs.io/)
+Python, [PyQt6](https://riverbankcomputing.com/software/pyqt/), [PyMuPDF](https://pymupdf.readthedocs.io/), [llama.cpp](https://github.com/ggml-org/llama.cpp) (via `llama-cpp-python`)
 
 ## License
 
