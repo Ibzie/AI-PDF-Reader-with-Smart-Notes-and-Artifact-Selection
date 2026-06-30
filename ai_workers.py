@@ -8,11 +8,12 @@ class LoadWorker(QThread):
     done = pyqtSignal(str)                  # model label
     failed = pyqtSignal(str)               # error message
 
-    def __init__(self, ai, parent=None):
+    def __init__(self, ai, parent=None, tier_idx=None):
         super().__init__(parent)
         self.ai = ai
         self.repo_id = None
         self.filename = None
+        self.tier_idx = tier_idx
 
     def run(self):
         try:
@@ -20,6 +21,7 @@ class LoadWorker(QThread):
                 on_status=lambda m: self.status.emit(m),
                 on_progress=lambda d, t, l: self.progress.emit(int(d), int(t), l),
                 repo_id=self.repo_id, filename=self.filename,
+                tier_idx=self.tier_idx,
             )
             self.done.emit(self.ai.model_label())
         except Exception as e:

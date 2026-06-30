@@ -7,13 +7,13 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QLabel, QLineEdit, QPushButton, QScrollArea, QFrame,
     QFileDialog, QMessageBox, QMenu, QListWidget, QListWidgetItem,
-    QStatusBar, QSplitter, QInputDialog, QProgressBar
+    QStatusBar, QSplitter, QInputDialog, QProgressBar, QWidgetAction
 )
 from pdf_engine import PdfEngine, ZOOM_LEVELS
 from page_view import PageView
 from notes_panel import NotesPanel
 from storage import PdfStorage
-from ai_layer import AILayer
+from ai_layer import AILayer, TIERS, detect_capacity, fit_level
 from ai_workers import LoadWorker, InferWorker
 
 
@@ -80,6 +80,14 @@ class MainWindow(QMainWindow):
         self.toolbar.addSeparator()
         self.toolbar.addWidget(QPushButton("☰", clicked=self.toggle_sidebar))
         self.toolbar.addWidget(QPushButton("📝", clicked=self.toggle_notes))
+        self.toolbar.addSeparator()
+        self.model_label = QPushButton("AI: idle")
+        self.model_label.setStyleSheet(
+            "QPushButton { background: #2a2a2a; color: #aaa; border: 1px solid #444; "
+            "padding: 4px 10px; text-align: left; } QPushButton:hover { background: #333; }"
+        )
+        self.model_label.clicked.connect(self.show_model_menu)
+        self.toolbar.addWidget(self.model_label)
         self.toolbar.addWidget(QPushButton("AI", clicked=self.show_ai_menu))
         self.ai_progress = QProgressBar()
         self.ai_progress.setFixedWidth(200)
@@ -166,6 +174,7 @@ class MainWindow(QMainWindow):
         self.search_box.clear()
         self.search_info.setText("")
         self.notes_panel.set_text(self.storage.load_notes())
+        self.notes_panel.set_base_dir(self.storage.folder)
         self._populate_bookmarks()
         self._update_info()
         self._rebuild_pages()
@@ -345,7 +354,7 @@ class MainWindow(QMainWindow):
         page.update()
         rel = filepath.relative_to(self.storage.folder).as_posix()
         self.notes_panel.append_markdown(
-            f"## Highlight — Page {page.page_idx + 1}\n\n"
+            f"### Highlight — Page {page.page_idx + 1}\n\n"
             f"> {text}\n\n"
             f"![highlight]({rel})\n\n"
             f"_Page {page.page_idx + 1}_"
@@ -384,7 +393,7 @@ class MainWindow(QMainWindow):
         filepath, entry = self.storage.save_capture(page.page_idx, cropped)
         rel = filepath.relative_to(self.storage.folder).as_posix()
         self.notes_panel.append_markdown(
-            f"## Screen Capture — Page {page.page_idx + 1}\n\n"
+            f"### Capture — Page {page.page_idx + 1}\n\n"
             f"![capture]({rel})\n\n"
             f"_Page {page.page_idx + 1}_"
         )
@@ -393,6 +402,32 @@ class MainWindow(QMainWindow):
         self.cancel_capture()
 
     # ── AI layer ────────────────────────────────────────────────────────────
+    def show_model_menu(self):
+        ram, _ = detect_capacity()
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background-color: #1e1e1e; border: 1px solid #444; padding: 4px; }")
+        for i, tier in enumerate(TIERS):
+            fit, color = fit_level(tier["footprint"], ram)
+            btn = QPushButton(
+                f"\u25cf  {tier['name']:<26} {fit:<10} ~{tier['footprint']:.1f} GB")
+            btn.setStyleSheet(
+                "QPushButton { text-align: left; padding: 8px 16px; border: none; "
+                "background: transparent; color: #eee; font-family: monospace; font-size: 13px; }"
+                "QPushButton:hover { background: #333; }"
+                f"QPushButton {{ color: {color}; }}"
+            )
+            idx = i
+            btn.clicked.connect(
+                lambda checked=False, idx=idx: (menu.close(), self._load_ai(idx)))
+            wa = QWidgetAction(menu)
+            wa.setDefaultWidget(btn)
+            menu.addAction(wa)
+        if self.ai.is_loaded():
+            menu.addSeparator()
+            menu.addAction("Unload Model", self._unload_ai)
+        menu.exec(QCursor.pos())
+
     def show_ai_menu(self):
         menu = QMenu(self)
         menu.setStyleSheet(
@@ -418,10 +453,13 @@ class MainWindow(QMainWindow):
             menu.addAction("Cancel AI", self._cancel_ai)
         menu.exec(QCursor.pos())
 
-    def _load_ai(self):
+    def _load_ai(self, tier_idx=None):
         if self.ai_loader and self.ai_loader.isRunning():
             return
-        self.ai_loader = LoadWorker(self.ai)
+        if self.ai.is_loaded():
+            self.ai.unload()
+        self.model_label.setText("AI: loading…")
+        self.ai_loader = LoadWorker(self.ai, tier_idx=tier_idx)
         self.ai_loader.status.connect(self._ai_load_status)
         self.ai_loader.progress.connect(self._ai_load_progress)
         self.ai_loader.done.connect(self._ai_loaded)
@@ -433,10 +471,21 @@ class MainWindow(QMainWindow):
         self.ai_progress_lbl.setText("AI: preparing…")
         self.ai_loader.start()
 
+    def _unload_ai(self):
+        self.ai.unload()
+        self.model_label.setText("AI: idle")
+        self.model_label.setStyleSheet(
+            "QPushButton { background: #2a2a2a; color: #aaa; border: 1px solid #444; "
+            "padding: 4px 10px; text-align: left; } QPushButton:hover { background: #333; }")
+        self.status.showMessage("AI model unloaded")
+
     def _ai_load_status(self, msg):
-        # Status messages render in the toolbar progress label, not bottom bar.
         if msg.startswith(("Detected", "Listing", "Downloading", "Loading")):
             self.ai_progress_lbl.setText(msg)
+            if msg.startswith("Downloading"):
+                self.model_label.setText("AI: downloading…")
+            elif msg.startswith("Loading"):
+                self.model_label.setText("AI: loading…")
         else:
             self.status.showMessage(msg)
 
@@ -444,19 +493,30 @@ class MainWindow(QMainWindow):
         if total <= 0:
             self.ai_progress.setRange(0, 0)
             self.ai_progress.setValue(0)
+            self.model_label.setText("AI: downloading…")
         else:
             self.ai_progress.setRange(0, total)
             self.ai_progress.setValue(done)
+            pct = int(done / total * 100) if total else 0
+            self.model_label.setText(f"AI: downloading {pct}%")
         self.ai_progress_lbl.setText(label or self.ai_progress_lbl.text())
 
     def _ai_loaded(self, label):
         self.ai_progress.setVisible(False)
         self.ai_progress_lbl.setVisible(False)
+        self.model_label.setText(label.replace("AI: ", ""))
+        self.model_label.setStyleSheet(
+            "QPushButton { background: #2a2a2a; color: #4caf50; border: 1px solid #444; "
+            "padding: 4px 10px; text-align: left; } QPushButton:hover { background: #333; }")
         self.status.showMessage(label)
 
     def _ai_failed(self, msg):
         self.ai_progress.setVisible(False)
         self.ai_progress_lbl.setVisible(False)
+        self.model_label.setText("AI: error")
+        self.model_label.setStyleSheet(
+            "QPushButton { background: #2a2a2a; color: #f44336; border: 1px solid #444; "
+            "padding: 4px 10px; text-align: left; } QPushButton:hover { background: #333; }")
         self.status.showMessage(f"AI error: {msg}")
 
     def _ai_ask(self):

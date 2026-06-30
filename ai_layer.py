@@ -54,10 +54,11 @@ KV_K_TIGHT = _Q4_0
 
 
 def detect_capacity():
-    """Return (available_ram_gb, accelerator) where accelerator in cuda|metal|cpu."""
+    """Return (budget_ram_gb, accelerator). Uses 85% of TOTAL system RAM so the
+    fit-level is stable and reflects the machine, not transient available RAM."""
     try:
         import psutil
-        ram = psutil.virtual_memory().available / (1024 ** 3)
+        ram = psutil.virtual_memory().total / (1024 ** 3) * 0.85
     except Exception:
         ram = 8.0
     accel = "cpu"
@@ -75,11 +76,22 @@ def detect_capacity():
 
 
 def pick_model(ram_gb):
+    """Auto-pick the largest model that fits with EASY headroom (1.5x + 2.5 GB)
+    so the first-run download is reasonably sized. Tight/Overflow models are
+    still available via the manual dropdown."""
     for tier in TIERS:
-        if ram_gb >= tier["min_ram"] and tier["footprint"] + HEADROOM_GB <= ram_gb:
+        if ram_gb >= tier["min_ram"] and ram_gb >= tier["footprint"] * 1.5 + HEADROOM_GB:
             return tier
-    # Fall back to the smallest tier if nothing fits cleanly.
     return TIERS[-1]
+
+
+def fit_level(footprint, ram_gb):
+    """Return (label, color_hex) for how well a model fits in RAM."""
+    if ram_gb >= footprint * 1.5 + HEADROOM_GB:
+        return "Easy", "#4caf50"
+    if ram_gb >= footprint + HEADROOM_GB:
+        return "Tight", "#FFC107"
+    return "Overflow", "#f44336"
 
 
 def resolve_quant(repo_id, quants, on_status=None):
@@ -188,12 +200,12 @@ class AILayer:
         self._cancel = False
 
     # ── loading ────────────────────────────────────────────────────────────
-    def load_model(self, on_status=None, on_progress=None, repo_id=None, filename=None):
+    def load_model(self, on_status=None, on_progress=None, repo_id=None, filename=None, tier_idx=None):
         ram, self.accel = detect_capacity()
         log.info("capacity: %.1f GB, accel=%s", ram, self.accel)
         if on_status:
             on_status(f"Detected {ram:.1f} GB RAM, accelerator: {self.accel}")
-        self.tier = pick_model(ram)
+        self.tier = TIERS[tier_idx] if tier_idx is not None else pick_model(ram)
         log.info("tier: %s (footprint %.1f GB)", self.tier["name"], self.tier["footprint"])
         self.repo_id = repo_id or self._first_available_repo(self.tier["repos"], on_status)
         files = [filename] if filename else resolve_quant(
