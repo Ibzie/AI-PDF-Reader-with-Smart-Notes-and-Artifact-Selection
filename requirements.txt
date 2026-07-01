@@ -6,3 +6,5 @@ psutil>=5.9
 markdown-it-py>=3.0
 mdit-py-plugins>=0.4
 linkify-it-py>=2.0
+rank-bm25>=0.2
+rapidfuzz>=3.0

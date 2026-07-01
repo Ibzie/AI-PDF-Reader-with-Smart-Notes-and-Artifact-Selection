@@ -38,7 +38,7 @@ TIERS = [
 ]
 
 HEADROOM_GB = 2.5
-N_CTX = 4096
+N_CTX = 8192
 MAX_TOKENS = 700
 
 # KV-cache quant: `type_k` takes the ggml type *integer* enum (not a string).
@@ -224,6 +224,7 @@ class AILayer:
         attempts += [
             (N_CTX, 0, kvk),
             (N_CTX, 0, KV_K_TIGHT),
+            (4096, 0, KV_K_TIGHT),
             (2048, 0, KV_K_TIGHT),
         ]
         from llama_cpp import Llama
@@ -308,13 +309,31 @@ class AILayer:
     def cancelled(self):
         return self._cancel
 
+    # ── RAG query expansion ──────────────────────────────────────────────────
+    def expand_query(self, question, doc_title=""):
+        if not self.llm:
+            return question
+        prompt = (f"Expand this query into 3-8 pipe-separated search terms. "
+                  f"Include the original words plus 2-3 synonyms. No prose.\n\n"
+                  f"QUERY: {question}\nOUTPUT:")
+        try:
+            resp = self.llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=80, stream=False, temperature=0.3,
+            )
+            return resp["choices"][0]["message"]["content"].strip()
+        except Exception:
+            return question
+
     # ── command dispatch ───────────────────────────────────────────────────
     # Each command returns (messages, heading) so the worker knows what to
     # prepend before streaming tokens into the notes file.
-    def build_request(self, command, *, notes="", page_text="", page_idx=None, question=""):
+    def build_request(self, command, *, notes="", page_text="", page_idx=None, question="", context=""):
         sys = (
             "You are an AI note assistant embedded in a PDF reader. "
             "Write in clean Markdown only. Be concise and faithful to the source. "
+            "Quote exact numbers, figures, and names verbatim from the source — "
+            "never round, approximate, or paraphrase them. "
             "When you reference content from the user's notes or a page, keep the "
             "`Page N` markers that appear in the source."
         )
@@ -329,6 +348,15 @@ class AILayer:
             user = (f"Answer the question using the notes below. "
                     f"If the notes don't cover it, say so.\n\n"
                     f"QUESTION: {question}\n\nNOTES:\n{notes}")
+            heading = "## AI — Answer"
+        elif command == "answer_rag":
+            user = (f"Answer using the context below. "
+                    f"Quote exact numbers, figures, dates, and names from the context "
+                    f"— do not round or paraphrase them. "
+                    f"Cite page numbers as [Page N]. "
+                    f"If the context doesn't contain the answer, say so.\n\n"
+                    f"--- CONTEXT ---\n{context}\n--- END CONTEXT ---\n\n"
+                    f"QUESTION: {question}")
             heading = "## AI — Answer"
         elif command == "extract_todos":
             user = f"Extract action items as a Markdown checklist.\n\nNOTES:\n{notes}"

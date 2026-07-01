@@ -1,9 +1,9 @@
 import re
 from pathlib import Path
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import QTimer, Qt, QUrl
 from PyQt6.QtGui import (
     QTextCursor, QTextDocument, QPageSize, QSyntaxHighlighter,
-    QTextCharFormat, QFont, QColor, QTextOption,
+    QTextCharFormat, QFont, QColor, QTextOption, QPixmap,
 )
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit,
@@ -14,8 +14,8 @@ from markdown_it import MarkdownIt
 from mdit_py_plugins.dollarmath import dollarmath_plugin
 from mdit_py_plugins.tasklists import tasklists_plugin
 
+BG = "#1a1a1a"  # editor background — used to hide syntax markers
 
-# ── LaTeX → Unicode for PDF export ──────────────────────────────────────────
 GREEK = {
     "alpha":"α","beta":"β","gamma":"γ","delta":"δ","epsilon":"ε","zeta":"ζ",
     "eta":"η","theta":"θ","iota":"ι","kappa":"κ","lambda":"λ","mu":"μ","nu":"ν",
@@ -30,7 +30,7 @@ SYMBOLS = {
     "cap":"∩","emptyset":"∅","rightarrow":"→","to":"→","leftarrow":"←",
     "Rightarrow":"⇒","Leftarrow":"⇐","Leftrightarrow":"⇔","cdot":"·",
     "ldots":"…","approx":"≈","equiv":"≡","propto":"∝","perp":"⊥","circ":"∘",
-    "deg":"°","sqrt":"√","frac":"",  # handled specially
+    "deg":"°","sqrt":"√",
 }
 SUPER = str.maketrans("0123456789+-=()n","⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿ")
 SUB = str.maketrans("0123456789+-=()aeox","₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₒₓ")
@@ -52,12 +52,9 @@ def latex_to_unicode(s):
 
 
 def render_markdown_html(text):
-    """Full markdown → HTML with math→Unicode, for PDF export."""
-    md = (
-        MarkdownIt("commonmark", {"html": True, "linkify": True, "breaks": True})
-        .enable("table").enable("strikethrough")
-        .use(dollarmath_plugin).use(tasklists_plugin)
-    )
+    md = (MarkdownIt("commonmark", {"html": True, "linkify": True, "breaks": True})
+          .enable("table").enable("strikethrough")
+          .use(dollarmath_plugin).use(tasklists_plugin))
     html = md.render(text)
     html = re.sub(r'<span class="math inline">(.*?)</span>',
                   lambda m: latex_to_unicode(m.group(1)), html, flags=re.DOTALL)
@@ -69,69 +66,165 @@ def render_markdown_html(text):
     return html
 
 
-# ── Syntax-highlighted single-panel editor ──────────────────────────────────
-class _MarkdownHighlighter(QSyntaxHighlighter):
-    """Styles markdown source in-place so the editor looks good while editable."""
+def _invisible():
+    f = QTextCharFormat()
+    f.setForeground(QColor(BG))
+    return f
+
+
+def _fmt(**kw):
+    f = QTextCharFormat()
+    if "bold" in kw: f.setFontWeight(QFont.Weight.Bold)
+    if "italic" in kw: f.setFontItalic(True)
+    if "color" in kw: f.setForeground(QColor(kw["color"]))
+    if "size" in kw: f.setFontPointSize(kw["size"])
+    if "mono" in kw: f.setFontFamily("monospace")
+    return f
+
+
+class _WysiwygHighlighter(QSyntaxHighlighter):
+    """Hides markdown syntax markers (colored as background) so the text
+    looks rendered while toPlainText() still returns the full markdown source."""
 
     def __init__(self, parent):
         super().__init__(parent)
         self._rules = []
-        # H1-H6: bold + colored + larger
-        for level, size in [(1, 20), (2, 17), (3, 15), (4, 14), (5, 13), (6, 13)]:
-            fmt = QTextCharFormat()
-            fmt.setFontWeight(QFont.Weight.Bold)
-            fmt.setFontPointSize(size)
-            fmt.setForeground(QColor("#569cd6"))
-            self._rules.append((re.compile(r'^' + '#' * level + r'\s+.*$'), fmt))
-        # Bold **text**
-        fmt = QTextCharFormat(); fmt.setFontWeight(QFont.Weight.Bold)
-        fmt.setForeground(QColor("#ddd"))
-        self._rules.append((re.compile(r'\*\*[^*]+\*\*'), fmt))
-        # Italic *text*
-        fmt = QTextCharFormat(); fmt.setFontItalic(True)
-        fmt.setForeground(QColor("#c586c0"))
-        self._rules.append((re.compile(r'(?<!\*)\*[^*]+\*(?!\*)'), fmt))
-        # Inline code `text`
-        fmt = QTextCharFormat(); fmt.setFontFamily("monospace")
-        fmt.setForeground(QColor("#ce9178"))
-        self._rules.append((re.compile(r'`[^`]+`'), fmt))
-        # Blockquotes >
-        fmt = QTextCharFormat(); fmt.setFontItalic(True)
-        fmt.setForeground(QColor("#808080"))
-        self._rules.append((re.compile(r'^>.*$'), fmt))
-        # Math $...$
-        fmt = QTextCharFormat(); fmt.setForeground(QColor("#b5cea8"))
-        self._rules.append((re.compile(r'\$[^$]+\$'), fmt))
+        # Headers: hide "# ", style the text
+        for level, size in [(1, 22), (2, 18), (3, 16), (4, 14), (5, 13), (6, 13)]:
+            self._rules.append((
+                re.compile(r'^(' + '#' * level + r'\s+)(.*)$'),
+                lambda m, f=_fmt(bold=True, color="#569cd6", size=size): [
+                    (m.start(1), m.end(1), _invisible()),
+                    (m.start(2), m.end(2), f),
+                ]))
+        # Bold: hide **, style content
+        self._rules.append((
+            re.compile(r'(\*\*)([^*]+)(\*\*)'),
+            lambda m: [
+                (m.start(1), m.end(1), _invisible()),
+                (m.start(2), m.end(2), _fmt(bold=True, color="#ddd")),
+                (m.start(3), m.end(3), _invisible()),
+            ]))
+        # Italic: hide *, style content
+        self._rules.append((
+            re.compile(r'(?<!\*)(\*)([^*]+)(\*)(?!\*)'),
+            lambda m: [
+                (m.start(1), m.end(1), _invisible()),
+                (m.start(2), m.end(2), _fmt(italic=True, color="#c586c0")),
+                (m.start(3), m.end(3), _invisible()),
+            ]))
+        # Inline code: hide `, style content
+        self._rules.append((
+            re.compile(r'(`)([^`]+)(`)'),
+            lambda m: [
+                (m.start(1), m.end(1), _invisible()),
+                (m.start(2), m.end(2), _fmt(mono=True, color="#ce9178")),
+                (m.start(3), m.end(3), _invisible()),
+            ]))
+        # Blockquote: hide "> "
+        self._rules.append((
+            re.compile(r'^(>\s*)(.*)$'),
+            lambda m: [
+                (m.start(1), m.end(1), _invisible()),
+                (m.start(2), m.end(2), _fmt(italic=True, color="#808080")),
+            ]))
+        # Inline math $...$: hide $, style content
+        self._rules.append((
+            re.compile(r'(\$)([^$]+)(\$)'),
+            lambda m: [
+                (m.start(1), m.end(1), _invisible()),
+                (m.start(2), m.end(2), _fmt(color="#b5cea8")),
+                (m.start(3), m.end(3), _invisible()),
+            ]))
+        # Task list: hide - [x] / - [ ], show ☑/☐ via color trick
+        self._rules.append((
+            re.compile(r'^(- \[x\])(.*)$', re.IGNORECASE),
+            lambda m: [
+                (m.start(1), m.end(1), _invisible()),
+                (m.start(2), m.end(2), _fmt(color="#4caf50")),
+            ]))
+        self._rules.append((
+            re.compile(r'^(- \[ \])(.*)$'),
+            lambda m: [
+                (m.start(1), m.end(1), _invisible()),
+                (m.start(2), m.end(2), _fmt(color="#FFC107")),
+            ]))
+        # Links: hide [ and ](, style text
+        self._rules.append((
+            re.compile(r'(\[)([^\]]+)(\]\()([^)]+)(\))'),
+            lambda m: [
+                (m.start(1), m.end(1), _invisible()),
+                (m.start(2), m.end(2), _fmt(color="#3794ff", bold=True)),
+                (m.start(3), m.end(5), _invisible()),
+            ]))
+        # Images: hide ![alt](path) — just dim it
+        self._rules.append((
+            re.compile(r'!\[([^\]]*)\]\([^)]+\)'),
+            lambda m: [(m.start(), m.end(), _fmt(color="#d19a66"))]))
+        # Horizontal rule: hide ---
+        self._rules.append((
+            re.compile(r'^(---+)$'),
+            lambda m: [(m.start(1), m.end(1), _invisible())]))
         # Block math $$...$$
-        self._rules.append((re.compile(r'\$\$.*?\$\$', re.DOTALL), fmt))
-        # Task list checkboxes
-        fmt_done = QTextCharFormat(); fmt_done.setForeground(QColor("#4caf50"))
-        self._rules.append((re.compile(r'- \[x\]'), fmt_done))
-        fmt_todo = QTextCharFormat(); fmt_todo.setForeground(QColor("#FFC107"))
-        self._rules.append((re.compile(r'- \[ \]'), fmt_todo))
-        # Links [text](url)
-        fmt = QTextCharFormat(); fmt.setForeground(QColor("#3794ff"))
-        self._rules.append((re.compile(r'\[([^\]]+)\]\([^)]+\)'), fmt))
-        # Horizontal rule
-        fmt = QTextCharFormat(); fmt.setForeground(QColor("#444"))
-        self._rules.append((re.compile(r'^---+$'), fmt))
-        # Image embeds ![alt](path)
-        fmt = QTextCharFormat(); fmt.setForeground(QColor("#d19a66"))
-        self._rules.append((re.compile(r'!\[([^\]]*)\]\([^)]+\)'), fmt))
+        self._rules.append((
+            re.compile(r'(\$\$)(.*?)(\$\$)', re.DOTALL),
+            lambda m: [
+                (m.start(1), m.end(1), _invisible()),
+                (m.start(2), m.end(2), _fmt(color="#b5cea8", size=12)),
+                (m.start(3), m.end(3), _invisible()),
+            ]))
 
     def highlightBlock(self, text):
-        for pattern, fmt in self._rules:
+        for pattern, formatter in self._rules:
             for m in pattern.finditer(text):
-                self.setFormat(m.start(), m.end() - m.start(), fmt)
+                try:
+                    parts = formatter(m)
+                    for start, end, fmt in parts:
+                        self.setFormat(start, end - start, fmt)
+                except Exception:
+                    pass
 
 
-class _AutoIndentEdit(QTextEdit):
+def _convert_inline_math(text):
+    """Replace $...$ with Unicode in a line of text."""
+    def repl(m):
+        return latex_to_unicode(m.group(1))
+    return re.sub(r'\$([^$]+)\$', repl, text)
+
+
+def _convert_checkboxes(text):
+    text = re.sub(r'- \[x\]\s*', '☑ ', text, flags=re.IGNORECASE)
+    text = re.sub(r'- \[ \]\s*', '☐ ', text)
+    return text
+
+
+class _WysiwygEdit(QTextEdit):
+    """Plain-text editor that auto-converts math/checkboxes and auto-indents on Enter."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._convert_on_enter = True
+
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not event.modifiers():
             cursor = self.textCursor()
+            # Convert math/checkboxes in the line being completed
+            if self._convert_on_enter:
+                line = cursor.block().text()
+                converted = _convert_checkboxes(_convert_inline_math(line))
+                if converted != line:
+                    cursor.beginEditBlock()
+                    cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+                    cursor.insertText(converted)
+                    cursor.endEditBlock()
+            # Auto-indent
             indent = re.match(r'^(\s*)', cursor.block().text()).group(1)
+            # List continuation: "- item" → next line starts with "- "
+            list_match = re.match(r'^(\s*)([-*]\s)', cursor.block().text())
             super().keyPressEvent(event)
-            if indent:
+            if list_match:
+                self.textCursor().insertText(list_match.group(1) + list_match.group(2))
+            elif indent:
                 self.textCursor().insertText(indent)
         else:
             super().keyPressEvent(event)
@@ -148,6 +241,8 @@ class NotesPanel(QWidget):
         self._flush = QTimer(self)
         self._flush.setInterval(80)
         self._flush.timeout.connect(self._drain)
+        self._image_list = []        # markdown strings for inline images (in order)
+        self._render_lock = False    # guard against recursive _on_edit
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
@@ -158,15 +253,15 @@ class NotesPanel(QWidget):
         self.btn_pdf.clicked.connect(self.export_pdf)
         bar.addWidget(self.btn_pdf)
         layout.addLayout(bar)
-        self.editor = _AutoIndentEdit()
+        self.editor = _WysiwygEdit()
         self.editor.setAcceptRichText(False)
         self.editor.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         self.editor.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.editor.setStyleSheet(
-            "QTextEdit { background-color: #1a1a1a; color: #ddd; border: 1px solid #444; "
-            "padding: 8px; }")
+            "QTextEdit { background-color: " + BG + "; color: #ddd; border: 1px solid #444; "
+            "padding: 8px; font-size: 14px; }")
         self.editor.textChanged.connect(self._on_edit)
-        self._highlighter = _MarkdownHighlighter(self.editor.document())
+        self._highlighter = _WysiwygHighlighter(self.editor.document())
         layout.addWidget(self.editor)
 
     def set_base_dir(self, path):
@@ -174,12 +269,15 @@ class NotesPanel(QWidget):
 
     def set_text(self, text):
         self._source = self._normalize(text)
+        self._render_lock = True
         self.editor.blockSignals(True)
         self.editor.setPlainText(self._source)
         self.editor.blockSignals(False)
+        self._render_images()
+        self._render_lock = False
 
     def get_text(self):
-        return self.editor.toPlainText()
+        return self._source
 
     def _normalize(self, text):
         lines = [line.rstrip() for line in text.split("\n")]
@@ -199,13 +297,16 @@ class NotesPanel(QWidget):
             self._source += "\n" if self._source.endswith("\n") else "\n\n"
         self._source += block.rstrip() + "\n\n"
         self._source = self._normalize(self._source)
+        self._render_lock = True
         self.editor.blockSignals(True)
         self.editor.setPlainText(self._source)
         self.editor.blockSignals(False)
+        self._render_images()
+        self._render_lock = False
         if self._callback:
             self._callback(self._source)
 
-    # ── AI streaming (buffered, throttled) ──────────────────────────────────
+    # ── AI streaming ────────────────────────────────────────────────────────
     def stream_start(self, heading):
         if self._source and not self._source.endswith("\n\n"):
             self._source += "\n" if self._source.endswith("\n") else "\n\n"
@@ -235,9 +336,12 @@ class NotesPanel(QWidget):
     def stream_end(self):
         self._flush.stop()
         self._source = self._normalize(self._source)
+        self._render_lock = True
         self.editor.blockSignals(True)
         self.editor.setPlainText(self._source)
         self.editor.blockSignals(False)
+        self._render_images()
+        self._render_lock = False
         if self._callback:
             self._callback(self._source)
         self._stream_heading = None
@@ -269,7 +373,62 @@ class NotesPanel(QWidget):
     def on_save(self, callback):
         self._callback = callback
 
+    def _render_images(self):
+        """Replace ![alt](path) text with actual inline images.
+        Tracks original markdown in _image_list so get_text() returns full source."""
+        doc = self.editor.document()
+        text = doc.toPlainText()
+        img_re = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
+        matches = list(img_re.finditer(text))
+        if not matches:
+            self._image_list = []
+            return
+        self._image_list = []
+        cursor = QTextCursor(doc)
+        # Process in reverse so positions don't shift
+        for m in reversed(matches):
+            full_md = m.group(0)
+            path = m.group(2)
+            if path.startswith(("http", "file:")):
+                resolved = path
+            elif self._base_dir:
+                resolved = str((self._base_dir / path).resolve())
+            else:
+                resolved = path
+            pix = QPixmap(resolved) if not resolved.startswith("http") else None
+            if pix is None or pix.isNull():
+                self._image_list.insert(0, full_md)
+                continue
+            max_w = 480
+            if pix.width() > max_w:
+                pix = pix.scaledToWidth(
+                    max_w, Qt.TransformationMode.SmoothTransformation)
+            idx = len(self._image_list)
+            url = QUrl(f"img://{idx}")
+            doc.addResource(QTextDocument.ResourceType.ImageResource, url, pix)
+            cursor.setPosition(m.start())
+            cursor.setPosition(m.end(), QTextCursor.MoveMode.KeepAnchor)
+            cursor.removeSelectedText()
+            cursor.insertImage(url.toString())
+            self._image_list.insert(0, full_md)
+        self._highlighter.setDocument(doc)  # re-highlight after image insertion
+
     def _on_edit(self):
-        self._source = self.editor.toPlainText()
+        if self._render_lock:
+            return
+        raw = self.editor.toPlainText()
+        parts = raw.split('\ufffc')  # U+FFFC = inline image object
+        n_imgs = len(parts) - 1
+        if n_imgs == len(self._image_list):
+            self._source = parts[0]
+            for i, md in enumerate(self._image_list):
+                self._source += md + parts[i + 1]
+        elif n_imgs < len(self._image_list):
+            self._image_list = self._image_list[:n_imgs]
+            self._source = parts[0]
+            for i, md in enumerate(self._image_list):
+                self._source += md + parts[i + 1]
+        else:
+            self._source = raw
         if self._callback:
             self._callback(self._source)

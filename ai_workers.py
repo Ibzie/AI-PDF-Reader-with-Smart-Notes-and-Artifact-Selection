@@ -4,9 +4,9 @@ from ai_layer import AILayer
 
 class LoadWorker(QThread):
     status = pyqtSignal(str)
-    progress = pyqtSignal(int, int, str)   # done_bytes, total_bytes, label
-    done = pyqtSignal(str)                  # model label
-    failed = pyqtSignal(str)               # error message
+    progress = pyqtSignal(int, int, str)
+    done = pyqtSignal(str)
+    failed = pyqtSignal(str)
 
     def __init__(self, ai, parent=None, tier_idx=None):
         super().__init__(parent)
@@ -28,10 +28,37 @@ class LoadWorker(QThread):
             self.failed.emit(str(e))
 
 
+class IndexWorker(QThread):
+    progress = pyqtSignal(int, int, str)
+    done = pyqtSignal(object)     # RagIndex
+    failed = pyqtSignal(str)
+
+    def __init__(self, engine, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+
+    def run(self):
+        try:
+            import fitz
+            from rag import RagIndex
+            doc = fitz.open(self.engine.path)
+            rag = RagIndex()
+            total = doc.page_count
+            for i in range(total):
+                self.progress.emit(i, total, f"Indexing page {i+1}/{total}…")
+                rag.index_page(doc.load_page(i), i)
+            rag.finalize()
+            doc.close()
+            self.done.emit(rag)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 class InferWorker(QThread):
     token = pyqtSignal(str)
     heading = pyqtSignal(str)
-    finished_ok = pyqtSignal(str)   # full heading line written
+    image_request = pyqtSignal(list)   # list of image chunk dicts
+    finished_ok = pyqtSignal(str)
     failed = pyqtSignal(str)
 
     def __init__(self, ai, command, parent=None, **kwargs):
@@ -42,10 +69,17 @@ class InferWorker(QThread):
 
     def run(self):
         try:
+            rag = self.kwargs.pop("rag", None)
+            doc_title = self.kwargs.pop("doc_title", "")
+            if self.command == "answer_rag" and rag and rag.is_ready:
+                expanded = self.ai.expand_query(self.kwargs.get("question", ""), doc_title)
+                chunks = rag.retrieve(expanded)
+                ctx, images = rag.assemble_context(chunks)
+                self.kwargs["context"] = ctx
+                if images:
+                    self.image_request.emit(images)
             messages, heading = self.ai.build_request(self.command, **self.kwargs)
             self.heading.emit(heading)
-            # Lazily buffer so callers can also get a clean string, but stream
-            # tokens to the UI as they arrive for live feedback.
             self.ai.generate(messages, on_token=lambda t: self.token.emit(t))
             self.finished_ok.emit(heading)
         except Exception as e:

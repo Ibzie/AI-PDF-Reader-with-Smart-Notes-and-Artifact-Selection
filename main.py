@@ -14,7 +14,7 @@ from page_view import PageView
 from notes_panel import NotesPanel
 from storage import PdfStorage
 from ai_layer import AILayer, TIERS, detect_capacity, fit_level
-from ai_workers import LoadWorker, InferWorker
+from ai_workers import LoadWorker, InferWorker, IndexWorker
 
 
 class MainWindow(QMainWindow):
@@ -33,6 +33,9 @@ class MainWindow(QMainWindow):
         self.ai = AILayer()
         self.ai_loader = None
         self.ai_infer = None
+        self.rag_index = None
+        self.index_worker = None
+        self._rag_images = []
         self.setWindowTitle("AI-PDF Reader")
         self.resize(1600, 900)
         self.setStyleSheet("background-color: #121212; color: #eeeeee;")
@@ -153,6 +156,25 @@ class MainWindow(QMainWindow):
         if self.storage:
             self.storage.save_notes(text)
 
+    def _start_indexing(self):
+        self.rag_index = None
+        self.index_worker = IndexWorker(self.engine)
+        self.index_worker.progress.connect(self._on_index_progress)
+        self.index_worker.done.connect(self._on_index_done)
+        self.index_worker.failed.connect(self._on_index_failed)
+        self.index_worker.start()
+
+    def _on_index_progress(self, page, total, msg):
+        if page == 0:
+            self.status.showMessage(msg)
+
+    def _on_index_done(self, rag):
+        self.rag_index = rag
+        self.status.showMessage("Index ready — Ask AI can now cite pages")
+
+    def _on_index_failed(self, msg):
+        self.status.showMessage(f"Indexing failed: {msg}")
+
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF Files (*.pdf)")
         if path:
@@ -180,6 +202,7 @@ class MainWindow(QMainWindow):
         self._rebuild_pages()
         self._apply_persisted_highlights()
         self.status.showMessage(f"Loaded {Path(path).name} — {self.engine.page_count} pages")
+        self._start_indexing()
 
     def _populate_bookmarks(self):
         self.bookmark_list.clear()
@@ -521,7 +544,14 @@ class MainWindow(QMainWindow):
 
     def _ai_ask(self):
         q, ok = QInputDialog.getText(self, "Ask AI", "Question:")
-        if ok and q:
+        if not ok or not q:
+            return
+        self.notes_panel.append_markdown(f"## Q — {q}")
+        if self.rag_index and self.rag_index.is_ready:
+            self.status.showMessage("AI: expanding query & retrieving context…")
+            self._run_ai("answer_rag", question=q, rag=self.rag_index,
+                         doc_title=Path(self.engine.path).stem)
+        else:
             self._run_ai("answer", question=q, notes=self.notes_panel.get_text())
 
     def _run_ai(self, command, **kwargs):
@@ -531,13 +561,41 @@ class MainWindow(QMainWindow):
         if self.ai_infer and self.ai_infer.isRunning():
             self.status.showMessage("AI busy — press Esc to cancel")
             return
+        self._rag_images = []
         self.ai_infer = InferWorker(self.ai, command, **kwargs)
         self.ai_infer.heading.connect(self.notes_panel.stream_start)
         self.ai_infer.token.connect(self.notes_panel.stream_token)
-        self.ai_infer.finished_ok.connect(lambda _: self.notes_panel.stream_end())
+        self.ai_infer.image_request.connect(self._render_rag_images)
+        self.ai_infer.finished_ok.connect(self._on_infer_done)
         self.ai_infer.failed.connect(self._ai_failed)
         self.ai_infer.start()
         self.status.showMessage(f"AI: {command.replace('_', ' ')}…  (Esc to cancel)")
+
+    def _render_rag_images(self, image_chunks):
+        if not self.storage or not self.engine.doc:
+            return
+        for chunk in image_chunks:
+            page_idx = chunk["page"]
+            if page_idx >= len(self.pages):
+                continue
+            page_widget = self.pages[page_idx]
+            rect = chunk["image_rect"]
+            img = self.engine.render_page(page_idx, page_widget.width())
+            zoom = page_widget.zoom
+            sx, sy = int(rect[0] * zoom), int(rect[1] * zoom)
+            sw, sh = int((rect[2] - rect[0]) * zoom), int((rect[3] - rect[1]) * zoom)
+            if sw < 10 or sh < 10:
+                continue
+            cropped = img.copy(sx, sy, sw, sh)
+            filepath = self.storage.save_rag_image(page_idx, cropped)
+            rel = filepath.relative_to(self.storage.folder).as_posix()
+            self._rag_images.append(f"![context — Page {page_idx+1}]({rel})\n_Page {page_idx+1}_")
+
+    def _on_infer_done(self, heading=None):
+        self.notes_panel.stream_end()
+        if self._rag_images:
+            self.notes_panel.append_markdown("\n\n---\n\n" + "\n\n".join(self._rag_images))
+            self._rag_images = []
 
     def _cancel_ai(self):
         self.ai.request_cancel()
@@ -574,7 +632,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         # Stop AI workers and free the model so failed runs don't leak RAM.
-        for w in (self.ai_loader, self.ai_infer):
+        for w in (self.ai_loader, self.ai_infer, self.index_worker):
             if w and w.isRunning():
                 self.ai.request_cancel()
                 w.quit()

@@ -70,6 +70,12 @@ class PdfStorage:
         self._save_json(self.annotations_file, self.annotations)
         return filepath, entry
 
+    def save_rag_image(self, page_idx, img):
+        filename = f"rag_p{page_idx}_{self._timestamp()}.png"
+        filepath = self.captures_dir / filename
+        img.save(str(filepath))
+        return filepath
+
     def load_notes(self):
         if self.notes_file.exists():
             return self.notes_file.read_text()
